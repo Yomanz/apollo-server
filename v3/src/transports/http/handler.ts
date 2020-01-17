@@ -1,8 +1,9 @@
 import { IncomingMessage, RequestListener, ServerResponse } from "http";
-import { IHttpRequest } from "./transport";
+import { IHttpRequest, SerializedGraphqlRequest } from "./transport";
 import { processHttpRequest } from "./transport";
 import { GraphQLRequest, PromisifyReturnType } from "../../types";
 import { ProcessGraphqlRequest } from "../../execution";
+import { parse as urlParse } from "url";
 
 export type AsyncRequestListener = PromisifyReturnType<RequestListener>;
 
@@ -99,7 +100,10 @@ export function httpHandler(
 }
 
 /**
- * Called in the event of a critical error within the HTTP handler.
+ * Called in the event of a bad request within the HTTP handler.
+ *
+ * This error means that the client sent something the server didn't understand.
+ * Sending the same request again is unlikely to succeed.
  *
  * @param res
  * @param errorMessage
@@ -114,6 +118,9 @@ function badRequest(
 
 /**
  * Called in the event of a critical error within the HTTP handler.
+ *
+ * This means a critical error happened within the server and that the client
+ * can send the same request again without changing it and it might succeed.
  *
  * @param res
  * @param errorMessage
@@ -149,6 +156,77 @@ function internalServerError(
  *
  */
 async function jsonBodyParse(req: IncomingMessage): Promise<GraphQLRequest> {
+  /**
+   * First we'll parse the body, however this doesn't parse objects within
+   * that body, like `variables` and `extensions`, which will need to be further
+   * unwrapped from their JSON encoding to form a processable `GraphQLRequest`.
+   * The blanks in this object will be filled in, as we parse those attributes.
+   * Note that `query` will not be parsed into a `DocumentNode` at this state,
+   * but instead deeper inside GraphQL execution, beyond the transport.
+   */
+  let stringifiedBody: SerializedGraphqlRequest;
+  if (req.method === 'POST') {
+    stringifiedBody = await parsePostRequest(req);
+  } else if (req.method === "GET") {
+    stringifiedBody = await parseGetRequest(req);
+  } else {
+    throw new Error(`Unsupported HTTP method '${req.method}'`)
+  }
+
+  // We'll destructure some parts into `parsedBody`, and save the rest for
+  // further processing.
+  const parsedBody: Partial<GraphQLRequest> = Object.create(null);
+  let unparsedVariables: string | undefined;
+  let unparsedExtensions: string | undefined;
+  ({
+    query: parsedBody.query,
+    operationName: parsedBody.operationName,
+    variables: unparsedVariables,
+    extensions: unparsedExtensions,
+  } = stringifiedBody);
+
+  if (unparsedVariables) {
+    parsedBody.variables = parseJsonInputAsObject(unparsedVariables,
+      "Malformed JSON input for 'variables'");
+  }
+
+  if (unparsedExtensions) {
+    parsedBody.extensions = parseJsonInputAsObject(unparsedExtensions,
+      "Malformed JSON input for 'extensions'");
+  }
+
+  return parsedBody;
+}
+
+async function parseGetRequest(
+  req: IncomingMessage,
+): Promise<SerializedGraphqlRequest> {
+  if (typeof req.url !== "string") {
+    throw new Error("Must have `url` on request to parse the query string.");
+  }
+
+  // We'll extract the parameters from the query string for GET requests.
+  const { query: parsedQueryString } = urlParse(req.url, true);
+
+  [
+    "query",
+    "operationName",
+    "variables",
+    "extensions",
+  ].forEach((paramName: string) => {
+    if (typeof parsedQueryString[paramName] === 'object') {
+      throw new Error(
+        `The '${paramName}' parameter must not be specified more than once.`);
+    }
+  });
+
+  return parsedQueryString;
+}
+
+async function parsePostRequest(
+  req: IncomingMessage,
+): Promise<SerializedGraphqlRequest> {
+  // On a POST, we'll read the body from the `Readable` stream.
   const body: string = await new Promise((resolve, reject) => {
     const data: Uint8Array[] = [];
     req
@@ -157,42 +235,10 @@ async function jsonBodyParse(req: IncomingMessage): Promise<GraphQLRequest> {
       .on('end', () => resolve(Buffer.concat(data).toString('utf-8')));
   });
 
-  /**
-   * First we'll parse the body, however this doesn't parse objects within
-   * that body, like `variables` and `extensions`, which will need to be further
-   * unwrapped from their JSON encoding to form a processable `GraphQLRequest`.
-   * The blanks in this object will be filled in, as we parse those attributes.
-   */
-  const parsedBody: Partial<GraphQLRequest> = Object.create(null);
-
-  // These will be parsed and added to the parsed body, when ready.
-  let unparsedVariables: string, unparsedExtensions: string;
-
-  /**
-   * Destructure the initial parsing of the request body in order to find an
-   * intermediate representation of a GraphQLRequest. Note that while the
-   * `query` must not be parsed into a `DocumentNode` at this stage, the
-   * `variables` and `extensions` should be parsed further with JSON.parse.
-   * Any unspecfied properties will be `undefined`. We could exclude them
-   * entirely, but for an internal data structure, this seems unnecessary.
-   */
-  ({
-    query: parsedBody.query,
-    operationName: parsedBody.operationName,
-    variables: unparsedVariables,
-    extensions: unparsedExtensions
-  } = parseJsonInputAsObject<GraphQLRequest>(
+  return parseJsonInputAsObject<GraphQLRequest>(
     body,
     "Body is malformed JSON",
-  ) || Object.create(null));
-
-  parsedBody.variables = parseJsonInputAsObject(unparsedVariables,
-    "Malformed JSON input for 'variables'");
-
-  parsedBody.extensions = parseJsonInputAsObject(unparsedExtensions,
-    "Malformed JSON input for 'extensions'");
-
-  return parsedBody;
+  ) || Object.create(null);
 }
 
 /**
@@ -224,4 +270,5 @@ export const __testing__ = {
   badRequest,
   internalServerError,
   jsonBodyParse,
+  parseGetRequest,
 }
